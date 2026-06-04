@@ -1,7 +1,7 @@
 import { describe, expect, it as bun_it } from "bun:test"
 import { Effect } from "effect"
 import { PluginV2 } from "@opencode-ai/core/plugin"
-import { SnowflakeCortexPlugin, cortexFetch } from "@opencode-ai/core/plugin/provider/snowflake-cortex"
+import { SnowflakeCortexPlugin, cortexBaseURL, cortexFetch } from "@opencode-ai/core/plugin/provider/snowflake-cortex"
 import { ProviderPlugins } from "@opencode-ai/core/plugin/provider"
 import { expectPluginRegistered, it, model, withEnv } from "./provider-helper"
 
@@ -100,11 +100,49 @@ describe("SnowflakeCortexPlugin", () => {
       }),
     ),
   )
+
+  it.effect("expands SNOWFLAKE_ACCOUNT in SDK baseURL options", () =>
+    withEnv({ SNOWFLAKE_ACCOUNT: "xy12345.us-east-1", SNOWFLAKE_CORTEX_PAT: "test-pat" }, () =>
+      Effect.gen(function* () {
+        const plugin = yield* PluginV2.Service
+        const captured: Record<string, unknown>[] = []
+        yield* plugin.add(SnowflakeCortexPlugin)
+        yield* plugin.add({
+          id: PluginV2.ID.make("inspector"),
+          effect: Effect.succeed({
+            "aisdk.sdk": (evt) =>
+              Effect.sync(() => {
+                captured.push({ ...evt.options })
+              }),
+          }),
+        })
+        yield* plugin.trigger(
+          "aisdk.sdk",
+          {
+            model: model("snowflake-cortex", "claude-sonnet-4-6"),
+            package: "@ai-sdk/openai-compatible",
+            options: {
+              name: "snowflake-cortex",
+              baseURL: "https://${SNOWFLAKE_ACCOUNT}.snowflakecomputing.com/api/v2/cortex/v1",
+            },
+          },
+          {},
+        )
+        expect(captured[0]?.baseURL).toBe("https://xy12345.us-east-1.snowflakecomputing.com/api/v2/cortex/v1")
+      }),
+    ),
+  )
 })
 
 type FetchLike = (url: string | URL | Request, init?: RequestInit) => Promise<Response>
 
 describe("cortexFetch", () => {
+  bun_it("builds baseURL from configured account", () => {
+    expect(cortexBaseURL({ account: "myorg-myaccount" })).toBe(
+      "https://myorg-myaccount.snowflakecomputing.com/api/v2/cortex/v1",
+    )
+  })
+
   bun_it("rewrites max_tokens to max_completion_tokens", async () => {
     const captured: RequestInit[] = []
     const upstream: FetchLike = async (_url, init) => {
@@ -173,10 +211,41 @@ describe("cortexFetch", () => {
   bun_it("rewrites role:'' to role:'assistant' in streaming SSE chunks", async () => {
     const chunk = `data: {"choices":[{"delta":{"role":"","content":"Hi"},"index":0}]}\n\n`
     const upstream: FetchLike = async () =>
-      new Response(new ReadableStream({ start: (ctrl) => { ctrl.enqueue(new TextEncoder().encode(chunk)); ctrl.close() } }), {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      })
+      new Response(
+        new ReadableStream({
+          start: (ctrl) => {
+            ctrl.enqueue(new TextEncoder().encode(chunk))
+            ctrl.close()
+          },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        },
+      )
+    const response = await cortexFetch(upstream)("https://test", {})
+    const text = await response.text()
+    expect(text).toContain('"role":"assistant"')
+    expect(text).not.toContain('"role":""')
+  })
+
+  bun_it("rewrites role:'' when streaming chunks split the JSON key", async () => {
+    const chunks = [`data: {"choices":[{"delta":{"ro`, `le":"","content":"Hi"},"index":0}]}\n\n`]
+    const upstream: FetchLike = async () =>
+      new Response(
+        new ReadableStream({
+          start: (ctrl) => {
+            for (const chunk of chunks) {
+              ctrl.enqueue(new TextEncoder().encode(chunk))
+            }
+            ctrl.close()
+          },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        },
+      )
     const response = await cortexFetch(upstream)("https://test", {})
     const text = await response.text()
     expect(text).toContain('"role":"assistant"')
